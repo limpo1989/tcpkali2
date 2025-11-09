@@ -2,6 +2,13 @@
 name = "tcpkali2"
 version = "0.1.0"
 edition = "2024"
+description = "A load testing tool for WebSocket and TCP server."
+authors = ["limpo1989 <limpo1989@gmail.com>"]
+repository = "https://github.com/limpo1989/tcpkali2"
+homepage = "https://github.com/limpo1989/tcpkali2"
+keywords = ["networking", "tcp", "websocket"]
+categories = ["command-line-utilities", "network-programming"]
+license = "Apache-2.0"
 
 [dependencies]
 clap = "4.5.37"
