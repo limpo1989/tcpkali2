@@ -61,7 +61,7 @@ pub async fn websocket_worker_pingpong(
     // Handle first message if configured
     if let Some(first_msg) = &config.first_message {
         let start = Instant::now();
-        if let Err(e) = write.send(Message::Binary(first_msg.clone().into())).await {
+        if let Err(e) = write.send(Message::Binary(first_msg.clone())).await {
             if !stats.is_shutting_down() && !config.quiet {
                 eprintln!("Failed to send first WebSocket message: {}", e);
             }
@@ -117,7 +117,7 @@ pub async fn websocket_worker_pingpong(
                     let send_time = Instant::now();
 
                     // Perform write operation
-                    if let Err(e) = write.send(Message::Binary(message.clone().into())).await {
+                    if let Err(e) = write.send(Message::Binary(message.clone())).await {
                         if !stats.is_shutting_down() && !config.quiet {
                             eprintln!("WebSocket send error: {}", e);
                         }
@@ -206,7 +206,7 @@ pub async fn websocket_worker_pipeline(
     // Handle first message if configured
     if let Some(first_msg) = &config.first_message {
         let start = Instant::now();
-        if let Err(e) = write.send(Message::Binary(first_msg.clone().into())).await {
+        if let Err(e) = write.send(Message::Binary(first_msg.clone())).await {
             if !stats.is_shutting_down() && !config.quiet {
                 eprintln!("Failed to send first WebSocket message: {}", e);
             }
@@ -292,7 +292,7 @@ pub async fn websocket_worker_pipeline(
                 sent_times.push(send_time);
 
                 // Perform write operation
-                if let Err(e) = write.send(Message::Binary(message.clone().into())).await {
+                if let Err(e) = write.send(Message::Binary(message.clone())).await {
                     if !stats.is_shutting_down() && !config.quiet {
                         eprintln!("WebSocket send error: {}", e);
                     }

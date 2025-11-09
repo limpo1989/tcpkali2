@@ -91,8 +91,6 @@ impl Stats {
         let last_count = self.last_print_count.swap(current_count, Ordering::Relaxed);
 
         let elapsed = (now - last_time) as f64 / 1000.0;
-        let qps = (current_count - last_count) as f64 / elapsed;
-
-        qps
+        (current_count - last_count) as f64 / elapsed
     }
 }

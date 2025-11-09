@@ -4,77 +4,67 @@ use rand::distr::Alphanumeric;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
-    if s.len() < 2 {
-        return Err("Duration string too short".to_string());
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("Duration string empty".to_string());
     }
 
-    if s.ends_with("ms") {
-        let num: u64 = s[..s.len() - 2]
+    let sl = s.to_lowercase();
+
+    // 先处理毫秒后缀
+    if sl.ends_with("ms") {
+        let num_str = sl.strip_suffix("ms").unwrap().trim();
+        if num_str.is_empty() {
+            return Err("Invalid duration number".to_string());
+        }
+        let num: u64 = num_str
             .parse()
             .map_err(|_| "Invalid duration number".to_string())?;
         return Ok(Duration::from_millis(num));
     }
 
-    let (num, unit) = s.split_at(s.len() - 1);
-    let num: u64 = num
+    // 必须至少有一个数字和一个单位字符
+    if sl.len() < 2 {
+        return Err("Duration string too short".to_string());
+    }
+
+    // 单字符单位：s, m, h, d
+    let (num_str, unit_str) = sl.split_at(sl.len() - 1);
+    let num_str = num_str.trim();
+    if num_str.is_empty() {
+        return Err("Invalid duration number".to_string());
+    }
+    let num: u64 = num_str
         .parse()
         .map_err(|_| "Invalid duration number".to_string())?;
 
-    match unit {
+    match unit_str {
         "s" => Ok(Duration::from_secs(num)),
-        "m" => Ok(Duration::from_secs(num * 60)),
-        "h" => Ok(Duration::from_secs(num * 3600)),
-        "d" => Ok(Duration::from_secs(num * 86400)),
+        "m" => Ok(Duration::from_secs(num.saturating_mul(60))),
+        "h" => Ok(Duration::from_secs(num.saturating_mul(3600))),
+        "d" => Ok(Duration::from_secs(num.saturating_mul(86_400))),
         _ => Err("Invalid duration unit".to_string()),
     }
 }
 
 pub fn parse_rate(s: &str) -> Result<u64, String> {
+    let s = s.trim();
     if s.is_empty() {
         return Err("Empty rate string".to_string());
     }
 
-    if s.ends_with('k') {
-        let num: u64 = s[..s.len() - 1]
-            .parse()
-            .map_err(|_| "Invalid rate number".to_string())?;
-        Ok(num * 1000)
-    } else {
-        s.parse().map_err(|_| "Invalid rate number".to_string())
-    }
-}
+    let sl = s.to_lowercase();
 
-#[allow(dead_code)]
-pub fn parse_bandwidth(s: &str) -> Result<u64, String> {
-    if s.is_empty() {
-        return Err("Empty bandwidth string".to_string());
+    if let Some(num_str) = sl.strip_suffix('k') {
+        let num: u64 = num_str
+            .trim()
+            .parse()
+            .map_err(|_| format!("Invalid rate number: '{}'", num_str.trim()))?;
+        return Ok(num.saturating_mul(1_000));
     }
 
-    let s = s.to_lowercase();
-    if s.ends_with("kbps") {
-        let num: u64 = s[..s.len() - 4]
-            .parse()
-            .map_err(|_| "Invalid bandwidth number".to_string())?;
-        Ok(num * 1000)
-    } else if s.ends_with("mbps") {
-        let num: u64 = s[..s.len() - 4]
-            .parse()
-            .map_err(|_| "Invalid bandwidth number".to_string())?;
-        Ok(num * 1_000_000)
-    } else if s.ends_with("kbps") {
-        let num: u64 = s[..s.len() - 3]
-            .parse()
-            .map_err(|_| "Invalid bandwidth number".to_string())?;
-        Ok(num * 1000 * 8)
-    } else if s.ends_with("mbps") {
-        let num: u64 = s[..s.len() - 3]
-            .parse()
-            .map_err(|_| "Invalid bandwidth number".to_string())?;
-        Ok(num * 1_000_000 * 8)
-    } else {
-        s.parse()
-            .map_err(|_| "Invalid bandwidth number".to_string())
-    }
+    sl.parse::<u64>()
+        .map_err(|_| format!("Invalid rate number: '{}'", sl))
 }
 
 pub fn unescape_string(s: &str) -> String {
@@ -152,15 +142,16 @@ pub fn get_file_arg(matches: &clap::ArgMatches, arg_name: &str, unescape: bool) 
 
 pub fn generate_payload(size: usize) -> Option<Bytes> {
     Some(Bytes::from(
-        rand::rng().sample_iter(&Alphanumeric).take(size).collect::<Vec<u8>>(),
+        rand::rng()
+            .sample_iter(&Alphanumeric)
+            .take(size)
+            .collect::<Vec<u8>>(),
     ))
 }
 
 pub fn unix_timestamp_millis() -> u64 {
     let now = SystemTime::now();
-    let timestamp = now
-        .duration_since(UNIX_EPOCH)
+    now.duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
-        .as_millis() as u64;
-    return timestamp;
+        .as_millis() as u64
 }

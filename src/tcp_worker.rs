@@ -114,7 +114,7 @@ pub async fn tcp_worker_pingpong(
                 let send_time = Instant::now();
 
                 // Perform write operation immediately
-                if let Err(e) = writer.write_all(&message).await {
+                if let Err(e) = writer.write_all(message).await {
                     if !stats.is_shutting_down() && !config.quiet {
                         eprintln!("Write error: {}", e);
                     }
@@ -284,7 +284,7 @@ pub async fn tcp_worker_pipeline(
                 sent_times.push(send_time);
 
                 // Perform write operation immediately
-                if let Err(e) = writer.write_all(&message).await {
+                if let Err(e) = writer.write_all(message).await {
                     if !stats.is_shutting_down() && !config.quiet {
                         eprintln!("Write error: {}", e);
                     }

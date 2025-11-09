@@ -37,10 +37,10 @@ pub fn parse_config(matches: &clap::ArgMatches) -> Arc<Config> {
         connect_rate: *matches.get_one::<u64>("connect-rate").unwrap(),
         connect_timeout: *matches.get_one::<Duration>("connect-timeout").unwrap(),
         channel_lifetime: matches.get_one::<Duration>("channel-lifetime").cloned(),
-        first_message: get_message_arg(&matches, "first-message", unescape)
-            .or_else(|| get_file_arg(&matches, "first-message-file", unescape)),
-        message: get_message_arg(&matches, "message", unescape)
-            .or_else(|| get_file_arg(&matches, "message-file", unescape))
+        first_message: get_message_arg(matches, "first-message", unescape)
+            .or_else(|| get_file_arg(matches, "first-message-file", unescape)),
+        message: get_message_arg(matches, "message", unescape)
+            .or_else(|| get_file_arg(matches, "message-file", unescape))
             .or_else(|| generate_payload(message_size)),
         message_size,
         message_rate: matches.get_one::<u64>("message-rate").cloned(),
@@ -51,7 +51,7 @@ pub fn parse_config(matches: &clap::ArgMatches) -> Arc<Config> {
 }
 
 pub fn new_command() -> clap::ArgMatches {
-    let matches = Command::new("tcpkali2")
+    Command::new("tcpkali2")
         .version("0.1.0")
         .about("A load testing tool for WebSocket and TCP server")
         .arg(
@@ -185,7 +185,5 @@ pub fn new_command() -> clap::ArgMatches {
                 .action(ArgAction::SetTrue)
                 .help("Suppress real-time output"),
         )
-        .get_matches();
-
-    return matches;
+        .get_matches()
 }
