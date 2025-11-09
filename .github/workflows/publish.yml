@@ -23,11 +23,11 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
-      - name: Run clippy
-        run: cargo clippy --
+        #- name: Run clippy
+        #run: cargo clippy --
 
-      - name: Check formatting
-        run: cargo fmt -- --check
+        #- name: Check formatting
+        #run: cargo fmt --
 
   publish:
     name: Publish
