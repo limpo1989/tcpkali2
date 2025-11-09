@@ -17,7 +17,7 @@ analysis.
 ## Installation
 
 ```bash
-cargo install --git https://github.com/limpo1989/tcpkali2
+cargo install tcpkali2
 ```
 
 ## Usage
