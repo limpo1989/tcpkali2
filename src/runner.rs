@@ -26,6 +26,13 @@ pub async fn async_main(matches: clap::ArgMatches) -> Result<(), TcpKaliError> {
     let config = crate::command::parse_config(&matches)?;
     let stats = Arc::new(Stats::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let workers = *matches.get_one::<usize>("workers").unwrap();
+    // Collect targets for CSV export (use first target for the CSV row)
+    let targets: Vec<String> = matches
+        .get_many::<String>("host:port")
+        .unwrap()
+        .cloned()
+        .collect();
 
     // Periodically output real-time statistics
     if !config.quiet {
@@ -42,7 +49,7 @@ pub async fn async_main(matches: clap::ArgMatches) -> Result<(), TcpKaliError> {
     };
 
     // Prepare tasks
-    for target in matches.get_many::<String>("host:port").unwrap() {
+    for target in targets.iter() {
         for i in 0..config.connections {
             let task_config = config.clone();
             let task_stats = stats.clone();
@@ -75,8 +82,17 @@ pub async fn async_main(matches: clap::ArgMatches) -> Result<(), TcpKaliError> {
     // Execute benchmark
     execute_benchmark(&config, &stats, &shutdown_tx, &mut tasks).await;
 
+    let elapsed = start_time.elapsed();
+
     // Output statistical results
-    Stats::print_final_stats(&stats, start_time.elapsed(), !config.quiet);
+    Stats::print_final_stats(&stats, elapsed, !config.quiet);
+
+    // Export to CSV if --output is specified
+    if let Some(ref path) = config.output {
+        let target = targets.first().map(|s| s.as_str()).unwrap_or("");
+        crate::csv_export::export_csv(path, &config, &stats, elapsed, target, workers);
+    }
+
     Ok(())
 }
 

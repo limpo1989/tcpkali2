@@ -62,6 +62,7 @@ Options:
   -f, --message-file <name>          Read message to send from a file
   -r, --message-rate <R>             Messages per second to send in a connection
   -q                                 Suppress real-time output
+  -o, --output <FILE>                Export final results to a CSV file
   -h, --help                         Print help
   -V, --version                      Print version
 ```

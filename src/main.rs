@@ -1,4 +1,5 @@
 mod command;
+mod csv_export;
 mod error;
 mod runner;
 mod stats;
@@ -18,7 +19,9 @@ fn main() -> Result<(), TcpKaliError> {
     let matches = new_command();
     let workers = *matches.get_one::<usize>("workers").unwrap();
     if workers == 0 {
-        return Err(TcpKaliError::Config("workers must be greater than 0".into()));
+        return Err(TcpKaliError::Config(
+            "workers must be greater than 0".into(),
+        ));
     }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)

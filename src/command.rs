@@ -1,7 +1,7 @@
 use crate::error::TcpKaliError;
 use crate::utils::{generate_payload, get_file_arg, get_message_arg, parse_duration, parse_rate};
 use bytes::Bytes;
-use clap::{Arg, ArgAction, Command, value_parser};
+use clap::{value_parser, Arg, ArgAction, Command};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,6 +38,8 @@ pub struct Config {
     pub message_rate: Option<u64>,
     /// Whether WebSocket is used
     pub use_websocket: bool,
+    /// Output CSV file path
+    pub output: Option<String>,
 }
 
 /// Parse command line arguments and create configuration
@@ -70,21 +72,30 @@ pub fn parse_config(matches: &clap::ArgMatches) -> Result<Arc<Config>, TcpKaliEr
         message_size,
         message_rate: matches.get_one::<u64>("message-rate").cloned(),
         use_websocket: matches.get_flag("websocket"),
+        output: matches.get_one::<String>("output").cloned(),
     };
 
     // Parameter validation
     if config.connections == 0 {
-        return Err(TcpKaliError::Config("connections must be greater than 0".into()));
+        return Err(TcpKaliError::Config(
+            "connections must be greater than 0".into(),
+        ));
     }
     if config.connect_timeout.as_secs_f64() == 0.0 {
-        return Err(TcpKaliError::Config("connect-timeout must be greater than 0".into()));
+        return Err(TcpKaliError::Config(
+            "connect-timeout must be greater than 0".into(),
+        ));
     }
     if config.duration.as_secs_f64() == 0.0 {
-        return Err(TcpKaliError::Config("duration must be greater than 0".into()));
+        return Err(TcpKaliError::Config(
+            "duration must be greater than 0".into(),
+        ));
     }
     if let Some(lifetime) = config.channel_lifetime {
         if lifetime.as_secs_f64() == 0.0 {
-            return Err(TcpKaliError::Config("channel-lifetime must be greater than 0 if specified".into()));
+            return Err(TcpKaliError::Config(
+                "channel-lifetime must be greater than 0 if specified".into(),
+            ));
         }
     }
 
@@ -97,7 +108,7 @@ pub fn parse_config(matches: &clap::ArgMatches) -> Result<Arc<Config>, TcpKaliEr
 /// * `clap::ArgMatches` - Parsed command line arguments
 pub fn new_command() -> clap::ArgMatches {
     Command::new("tcpkali2")
-        .version(env!("CARGO_PKG_VERSION") )
+        .version(env!("CARGO_PKG_VERSION"))
         .about("A load testing tool for WebSocket and TCP server")
         .arg(
             Arg::new("host:port")
@@ -237,6 +248,13 @@ pub fn new_command() -> clap::ArgMatches {
                 .short('q')
                 .action(ArgAction::SetTrue)
                 .help("Suppress real-time output"),
+        )
+        .arg(
+            Arg::new("output")
+                .short('o')
+                .long("output")
+                .value_name("FILE")
+                .help("Export final results to a CSV file"),
         )
         .get_matches()
 }
