@@ -21,23 +21,29 @@ impl LocalStatsCache {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Record request to local cache
     pub fn record_request(&mut self, bytes_sent: usize, bytes_received: usize) {
         self.requests += 1;
         self.bytes_sent += bytes_sent as u64;
         self.bytes_received += bytes_received as u64;
     }
-    
+
     /// Commit local cache to global statistics
     pub fn commit_to(&self, stats: &Stats) {
         if self.requests > 0 {
-            stats.total_requests.fetch_add(self.requests, Ordering::Relaxed);
-            stats.total_bytes_sent.fetch_add(self.bytes_sent, Ordering::Relaxed);
-            stats.total_bytes_received.fetch_add(self.bytes_received, Ordering::Relaxed);
+            stats
+                .total_requests
+                .fetch_add(self.requests, Ordering::Relaxed);
+            stats
+                .total_bytes_sent
+                .fetch_add(self.bytes_sent, Ordering::Relaxed);
+            stats
+                .total_bytes_received
+                .fetch_add(self.bytes_received, Ordering::Relaxed);
         }
     }
-    
+
     /// Reset local cache
     pub fn reset(&mut self) {
         self.requests = 0;
@@ -131,7 +137,7 @@ impl Stats {
                 .fetch_add(bytes_received as u64, Ordering::Relaxed);
         }
     }
-    
+
     /// Batch record request data (using local cache)
     ///
     /// # Arguments
@@ -139,9 +145,12 @@ impl Stats {
     #[allow(dead_code)]
     pub fn record_request_batch(&self, cache: &LocalStatsCache) {
         if !self.is_warmup() && cache.requests > 0 {
-            self.total_requests.fetch_add(cache.requests, Ordering::Relaxed);
-            self.total_bytes_sent.fetch_add(cache.bytes_sent, Ordering::Relaxed);
-            self.total_bytes_received.fetch_add(cache.bytes_received, Ordering::Relaxed);
+            self.total_requests
+                .fetch_add(cache.requests, Ordering::Relaxed);
+            self.total_bytes_sent
+                .fetch_add(cache.bytes_sent, Ordering::Relaxed);
+            self.total_bytes_received
+                .fetch_add(cache.bytes_received, Ordering::Relaxed);
         }
     }
 
@@ -202,12 +211,12 @@ impl Stats {
         let last_count = self.last_print_count.swap(current_count, Ordering::Relaxed);
 
         let elapsed_ms = now - last_time;
-        
+
         // Avoid division by zero: if time interval is less than 1ms, return 0.0
         if elapsed_ms < 1 {
             return 0.0;
         }
-        
+
         let elapsed = elapsed_ms as f64 / 1000.0;
         (current_count - last_count) as f64 / elapsed
     }
@@ -241,7 +250,7 @@ impl Stats {
             0.0
         };
         let error_rate = if total_requests > 0 {
-            stats.connection_errors.load(Ordering::Relaxed) as f64 / (total_requests as f64 * 100.0)
+            stats.connection_errors.load(Ordering::Relaxed) as f64 / total_requests as f64 * 100.0
         } else {
             0.0
         };
@@ -262,10 +271,7 @@ impl Stats {
             "Throughput:        {:.2} MB",
             total_bytes as f64 / 1_000_000.0
         );
-        println!(
-            "Bandwidth:         {:.2} MB/s",
-            bandwidth
-        );
+        println!("Bandwidth:         {:.2} MB/s", bandwidth);
         println!(
             "Traffic:           {:.2}↓, {:.2}↑ Mbps",
             total_bytes_received * 8 / 1000000,

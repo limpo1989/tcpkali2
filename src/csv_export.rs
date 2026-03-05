@@ -74,7 +74,7 @@ fn build_row(
     };
 
     let error_rate = if total_requests > 0 {
-        stats.connection_errors.load(Ordering::Relaxed) as f64 / (total_requests as f64 * 100.0)
+        stats.connection_errors.load(Ordering::Relaxed) as f64 / total_requests as f64 * 100.0
     } else {
         0.0
     };
