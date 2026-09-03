@@ -1,19 +1,19 @@
-#![allow(unused_assignments)]
-
 use crate::command::Config;
 use crate::error::TcpKaliError;
-use crate::stats::Stats;
+use crate::stats::{LocalStatsCache, Stats};
+use crate::utils::{RatePacer, wait_for_benchmark_lifetime, wait_for_load_start};
 
-use crossbeam_deque::Injector;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::{Semaphore, mpsc};
+use tokio::time::{self, Instant};
 
-/// Optimized error handling macro
-/// Reduces repeated stats.is_shutting_down() && !config.quiet checks
+const PIPELINE_READ_BUFFER_BYTES: usize = 8 * 1024;
+const MAX_IN_FLIGHT_BATCHES: usize = 4;
+
 macro_rules! log_error {
     ($stats:expr, $config:expr, $($arg:tt)*) => {
         if !$stats.is_shutting_down() && !$config.quiet {
@@ -22,473 +22,338 @@ macro_rules! log_error {
     };
 }
 
+struct SentBatch {
+    sent_at: Instant,
+    remaining: usize,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
 
-
-/// TCP worker main function
-///
-/// # Arguments
-/// * `target` - Target server address
-/// * `config` - Configuration object
-/// * `stats` - Statistics object
-/// * `shutdown` - Shutdown signal receiver
-///
-/// # Returns
-/// * `Result<(), TcpKaliError>` - Execution result
+/// Runs one TCP connection. Global benchmark shutdown is handled by aborting
+/// this task, so the per-message path does not poll a shared shutdown channel.
 pub async fn tcp_worker(
     target: &str,
     config: Arc<Config>,
     stats: Arc<Stats>,
-    shutdown: tokio::sync::broadcast::Receiver<()>,
+    load_start: tokio::sync::watch::Receiver<bool>,
+    benchmark_start: Option<tokio::sync::watch::Receiver<Option<Instant>>>,
 ) -> Result<(), TcpKaliError> {
+    let worker = run_tcp_worker(target, &config, &stats, load_start);
+    tokio::pin!(worker);
+
+    if let Some(lifetime) = config.channel_lifetime {
+        let benchmark_start = benchmark_start.expect("Benchmark start receiver must be provided");
+        tokio::select! {
+            result = &mut worker => result,
+            _ = wait_for_benchmark_lifetime(benchmark_start, lifetime) => Ok(()),
+        }
+    } else {
+        worker.await
+    }
+}
+
+async fn run_tcp_worker(
+    target: &str,
+    config: &Config,
+    stats: &Stats,
+    load_start: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), TcpKaliError> {
+    stats.total_connections.fetch_add(1, Ordering::Relaxed);
+
+    let stream = match time::timeout(config.connect_timeout, TcpStream::connect(target)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => {
+            log_error!(stats, config, "Failed to connect to {}: {}", target, error);
+            stats.record_connection_error();
+            return Ok(());
+        }
+        Err(_) => {
+            log_error!(stats, config, "Connection timeout to {}", target);
+            stats.record_connection_error();
+            return Ok(());
+        }
+    };
+
+    stream.set_nodelay(!config.nagle)?;
+    let (mut reader, mut writer) = stream.into_split();
+
+    if let Some(first_message) = &config.first_message {
+        let sent_at = Instant::now();
+        if let Err(error) = writer.write_all(first_message).await {
+            log_error!(stats, config, "Failed to send first message: {}", error);
+            stats.record_connection_error();
+            return Ok(());
+        }
+
+        let mut response = vec![0; first_message.len()];
+        if let Err(error) = reader.read_exact(&mut response).await {
+            log_error!(
+                stats,
+                config,
+                "Failed to read first message response: {}",
+                error
+            );
+            stats.record_connection_error();
+            return Ok(());
+        }
+
+        let latency_us = sent_at.elapsed().as_micros().max(1) as u64;
+        stats.record_latency(latency_us, 0);
+        stats.record_request(first_message.len(), first_message.len());
+    }
+
+    stats.success_connections.fetch_add(1, Ordering::Relaxed);
+    wait_for_load_start(load_start).await;
+
+    let message = config.message.as_ref().expect("Message must be provided");
+    if message.is_empty() || config.message_rate == Some(0) {
+        std::future::pending::<()>().await;
+        return Ok(());
+    }
+
     if config.pipeline {
-        tcp_worker_pipeline(target, config, stats, shutdown).await
+        run_pipeline(reader, writer, config, stats).await
     } else {
-        tcp_worker_pingpong(target, config, stats, shutdown).await
+        run_pingpong(reader, writer, config, stats).await
     }
 }
 
-/// TCP ping-pong mode worker
-///
-/// # Arguments
-/// * `target` - Target server address
-/// * `config` - Configuration object
-/// * `stats` - Statistics object
-/// * `shutdown` - Shutdown signal receiver
-///
-/// # Returns
-/// * `Result<(), TcpKaliError>` - Execution result
-pub async fn tcp_worker_pingpong(
-    target: &str,
-    config: Arc<Config>,
-    stats: Arc<Stats>,
-    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+async fn run_pingpong(
+    mut reader: OwnedReadHalf,
+    mut writer: OwnedWriteHalf,
+    config: &Config,
+    stats: &Stats,
 ) -> Result<(), TcpKaliError> {
-    stats.total_connections.fetch_add(1, Ordering::Relaxed);
-
-    // Connect to server
-    let stream = match time::timeout(config.connect_timeout, TcpStream::connect(target)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            log_error!(stats, config, "Failed to connect to {}: {}", target, e);
-            stats.record_connection_error();
-            return Ok(());
-        }
-        Err(_) => {
-            log_error!(stats, config, "Connection timeout to {}", target);
-            stats.record_connection_error();
-            return Ok(());
-        }
-    };
-
-    // Whether Nagle algorithm is enabled
-    if config.nagle {
-        stream.set_nodelay(false)?;
-    }
-
-    let (mut reader, mut writer) = stream.into_split();
-
-    // Handle first message if configured
-    if let Some(first_msg) = &config.first_message {
-        let start = Instant::now();
-        // Use write instead of write_all to reduce system calls
-        match writer.write(first_msg).await {
-            Ok(n) if n == first_msg.len() => { /* Successfully wrote complete message */ }
-            Ok(_) => {
-                if !stats.is_shutting_down() && !config.quiet {
-                    eprintln!("Partial write of first message");
-                }
-                stats.record_connection_error();
-                return Ok(());
-            }
-            Err(e) => {
-                if !stats.is_shutting_down() && !config.quiet {
-                    eprintln!("Failed to send first message: {}", e);
-                }
-                stats.record_connection_error();
-                return Ok(());
-            }
-        }
-
-        // Wait for first message response
-        let mut response_buf = vec![0u8; first_msg.len()];
-        match reader.read_exact(&mut response_buf).await {
-            Ok(_) => {
-                let latency = start.elapsed().as_micros() as u64;
-                stats.record_latency(latency, 0);
-                stats.record_request(first_msg.len(), first_msg.len());
-            }
-            Err(e) => {
-                if !stats.is_shutting_down() && !config.quiet {
-                    eprintln!("Failed to read first message response: {}", e);
-                }
-                stats.record_connection_error();
-                return Ok(());
-            }
-        }
-    }
-
-    // Prepare payload for main benchmark
     let message = config.message.as_ref().expect("Message must be provided");
+    let mut response = vec![0; message.len()];
+    let mut pacer = RatePacer::new(config.message_rate);
+    let mut local_stats = LocalStatsCache::new(stats);
 
-    let message_size = message.len();
+    loop {
+        pacer.wait().await;
+        let sent_at = Instant::now();
 
-    // Writer task
-    let start_time = Instant::now();
-    // Pre-calculate end time to avoid repeated calculation in loop
-    // channel-lifetime starts after warmup ends
-    let end_time = config.channel_lifetime.map(|lifetime| start_time + config.warmup_duration + lifetime);
-    let mut counter = 0;
-    // Time-based yield: yield every 10ms to avoid frequent modulo operations
-    #[allow(unused_assignments)]
-    let mut last_yield_time = Instant::now();
-    const YIELD_INTERVAL: Duration = Duration::from_millis(10);
-
-    // Pre-allocate buffer and reuse in loop to avoid repeated allocation
-    let mut buf = vec![0u8; message_size];
-    let expected_len = message_size;
-
-    // If message rate is 0 or message size is 0, only wait without sending messages
-    if config.message_rate == Some(0) || message.len() == 0 {
-        // Wait loop: only check connection lifetime and shutdown signal
-        loop {
-            if let Some(end) = end_time {
-                if Instant::now() >= end {
-                    break;
-                }
-            }
-
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                    // Brief sleep to avoid busy waiting
-                    continue;
-                }
-                _ = shutdown.recv() => break,
-            }
+        if let Err(error) = writer.write_all(message).await {
+            log_error!(stats, config, "Write error: {}", error);
+            stats.record_connection_error();
+            return Ok(());
         }
-    } else {
-        // Original message sending loop
-        loop {
-            if let Some(end) = end_time {
-                if Instant::now() >= end {
-                    break;
-                }
-            }
 
-            tokio::select! {
-                _ = async {
-                    if stats.is_shutting_down() {
-                        return;
-                    }
-
-                    // Record send time before actual write
-                    let send_time = Instant::now();
-
-                    // Perform write operation immediately
-                    // Use write instead of write_all to reduce system calls overhead
-                    match writer.write(message).await {
-                        Ok(n) if n == message.len() => {
-                            // Successfully wrote complete message
-                        }
-                        Ok(_) => {
-                            if !stats.is_shutting_down() && !config.quiet {
-                                eprintln!("Partial write");
-                            }
-                            stats.record_connection_error();
-                            return;
-                        }
-                        Err(e) => {
-                            if !stats.is_shutting_down() && !config.quiet {
-                                eprintln!("Write error: {}", e);
-                            }
-                            stats.record_connection_error();
-                            return;
-                        }
-                    }
-
-                    counter += 1;
-
-                    match reader.read_exact(&mut buf[..expected_len]).await {
-                    Ok(n) if n == expected_len => {
-                        // Cache elapsed result to avoid repeated calculation
-                        let elapsed = send_time.elapsed();
-                        let latency = elapsed.as_micros() as u64;
-                        stats.record_latency(latency, counter);
-                        stats.record_request(expected_len, expected_len);
-
-                        // Optimize message rate control: use cached elapsed result
-                        if let Some(rate) = config.message_rate {
-                            if rate > 0 {
-                                // Pre-calculate target interval (nanosecond precision)
-                                const NANOS_PER_SEC: u64 = 1_000_000_000;
-                                let target_interval_ns = NANOS_PER_SEC / rate;
-                                let elapsed_ns = elapsed.as_nanos() as u64;
-
-                                if elapsed_ns < target_interval_ns {
-                                    let sleep_ns = target_interval_ns - elapsed_ns;
-                                    if sleep_ns > 1_000_000 { // Only sleep when exceeding 1ms
-                                        time::sleep(Duration::from_nanos(sleep_ns)).await;
-                                    }
-                                }
-                            }
-                            // If rate == 0, no rate control and no message sending?
-                            // Current loop continues to send messages, but user may expect no messages.
-                            // For backward compatibility, we still send messages (may be empty).
-                        }
-                    }
-                    Ok(_) => return, // Unexpected EOF
-                    Err(e) => {
-                        if !stats.is_shutting_down() && !config.quiet {
-                            eprintln!("Read error: {}", e);
-                        }
-                        stats.record_connection_error();
-                        return;
-                    }
-                }
-
-                // Time-based yield: check every 10ms if yield is needed
-                if last_yield_time.elapsed() >= YIELD_INTERVAL {
-                    tokio::task::yield_now().await;
-                    last_yield_time = Instant::now();
-                }
-                } => {},
-                _ = shutdown.recv() => break,
-            }
+        if let Err(error) = reader.read_exact(&mut response).await {
+            log_error!(stats, config, "Read error: {}", error);
+            stats.record_connection_error();
+            return Ok(());
         }
+
+        local_stats.record_responses(
+            1,
+            message.len(),
+            message.len(),
+            sent_at.elapsed().as_micros().max(1) as u64,
+        );
+        pacer.advance(1);
     }
-
-    // Clean up reader task
-    drop(writer);
-    stats.success_connections.fetch_add(1, Ordering::Relaxed);
-    Ok(())
 }
 
-/// TCP pipeline mode worker
-///
-/// Implements pipeline pattern where multiple messages can be sent without waiting for responses.
-///
-/// # Arguments
-/// * `target` - Target server address
-/// * `config` - Configuration object
-/// * `stats` - Statistics object
-/// * `shutdown` - Shutdown signal receiver
-///
-/// # Returns
-/// * `Result<(), TcpKaliError>` - Execution result
-pub async fn tcp_worker_pipeline(
-    target: &str,
-    config: Arc<Config>,
-    stats: Arc<Stats>,
-    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+async fn run_pipeline(
+    reader: OwnedReadHalf,
+    writer: OwnedWriteHalf,
+    config: &Config,
+    stats: &Stats,
 ) -> Result<(), TcpKaliError> {
-    stats.total_connections.fetch_add(1, Ordering::Relaxed);
+    let (sent_tx, sent_rx) = mpsc::unbounded_channel();
+    let window = Arc::new(Semaphore::new(MAX_IN_FLIGHT_BATCHES));
 
-    // Connect to server
-    let stream = match time::timeout(config.connect_timeout, TcpStream::connect(target)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            log_error!(stats, config, "Failed to connect to {}: {}", target, e);
-            stats.record_connection_error();
-            return Ok(());
-        }
-        Err(_) => {
-            log_error!(stats, config, "Connection timeout to {}", target);
-            stats.record_connection_error();
-            return Ok(());
-        }
-    };
-
-    // Whether Nagle algorithm is enabled
-    if config.nagle {
-        stream.set_nodelay(false)?;
+    tokio::select! {
+        result = pipeline_writer(writer, config, stats, sent_tx, window) => result,
+        result = pipeline_reader(reader, config, stats, sent_rx) => result,
     }
+}
 
-    let (mut reader, mut writer) = stream.into_split();
-    // Use cross-thread Injector queue to implement pipeline mode
-    let sent_times = Arc::new(Injector::<Instant>::new());
-
-    // Handle first message if configured
-    if let Some(first_msg) = &config.first_message {
-        let start = Instant::now();
-        // Use write instead of write_all to reduce system calls
-        match writer.write(first_msg).await {
-            Ok(n) if n == first_msg.len() => { /* Successfully wrote complete message */ }
-            Ok(_) => {
-                if !stats.is_shutting_down() && !config.quiet {
-                    eprintln!("Partial write of first message");
-                }
-                stats.record_connection_error();
-                return Ok(());
-            }
-            Err(e) => {
-                if !stats.is_shutting_down() && !config.quiet {
-                    eprintln!("Failed to send first message: {}", e);
-                }
-                stats.record_connection_error();
-                return Ok(());
-            }
-        }
-
-        // Wait for first message response
-        let mut response_buf = vec![0u8; first_msg.len()];
-        match reader.read_exact(&mut response_buf).await {
-            Ok(_) => {
-                let latency = start.elapsed().as_micros() as u64;
-                stats.record_latency(latency, 0);
-                stats.record_request(first_msg.len(), first_msg.len());
-            }
-            Err(e) => {
-                if !stats.is_shutting_down() && !config.quiet {
-                    eprintln!("Failed to read first message response: {}", e);
-                }
-                stats.record_connection_error();
-                return Ok(());
-            }
-        }
-    }
-
-    // Prepare payload for main benchmark
+async fn pipeline_writer(
+    mut writer: OwnedWriteHalf,
+    config: &Config,
+    stats: &Stats,
+    sent_tx: mpsc::UnboundedSender<SentBatch>,
+    window: Arc<Semaphore>,
+) -> Result<(), TcpKaliError> {
     let message = config.message.as_ref().expect("Message must be provided");
+    let pipeline_message = config
+        .pipeline_message
+        .as_ref()
+        .expect("Pipeline message must be provided");
+    let mut pacer = RatePacer::new(config.message_rate);
 
-    let message_size = message.len();
+    loop {
+        let message_count = pacer.batch_size(config.pipeline_batch_size);
+        pacer.wait().await;
+        let permit = window
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("Pipeline semaphore must remain open");
 
-    // Spawn reader task for full-duplex operation
-    let reader_stats = stats.clone();
-    let reader_config = config.clone();
-    let reader_sent_times = sent_times.clone();
-    let reader_handle = tokio::spawn(async move {
-        // Pre-allocate buffer and reuse in loop to avoid repeated allocation
-        let mut buf = vec![0u8; message_size];
-        let expected_len = message_size;
-        let mut counter: usize = 0;
-
-        loop {
-            tokio::select! {
-                result = reader.read_exact(&mut buf[..expected_len]) => {
-                    match result {
-                        Ok(n) if n == expected_len => {
-                            counter += 1;
-                            // Use Injector's steal method to get elements
-                            if let crossbeam_deque::Steal::Success(sent_time) = reader_sent_times.steal() {
-                                let latency = sent_time.elapsed().as_micros() as u64;
-                                reader_stats.record_request(expected_len, expected_len);
-                                reader_stats.record_latency(latency, counter);
-                            }
-                        }
-                        Ok(_) => break, // Unexpected EOF
-                        Err(e) => {
-                            if !reader_stats.is_shutting_down() && !reader_config.quiet {
-                                eprintln!("Read error: {}", e);
-                            }
-                            reader_stats.record_connection_error();
-                            break;
-                        }
-                    }
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    // Handle shutdown signal
-                    break;
-                }
-            }
+        let byte_count = message.len() * message_count;
+        let sent_at = Instant::now();
+        if sent_tx
+            .send(SentBatch {
+                sent_at,
+                remaining: message_count,
+                _permit: permit,
+            })
+            .is_err()
+        {
+            return Ok(());
         }
-    });
 
-    // Writer task
-    let start_time = Instant::now();
-    // Pre-calculate end time to avoid repeated calculation in loop
-    // channel-lifetime starts after warmup ends
-    let end_time = config.channel_lifetime.map(|lifetime| start_time + config.warmup_duration + lifetime);
-    let mut counter = 0;
-    // Time-based yield: yield every 10ms to avoid frequent modulo operations
-    #[allow(unused_assignments)]
-    let mut last_yield_time = Instant::now();
-    const YIELD_INTERVAL: Duration = Duration::from_millis(10);
-
-    // If message rate is 0 or message size is 0, only wait without sending messages
-    if config.message_rate == Some(0) || message.len() == 0 {
-        // Wait loop: only check connection lifetime and shutdown signal
-        loop {
-            if let Some(end) = end_time {
-                if Instant::now() >= end {
-                    break;
-                }
-            }
-
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                    // Brief sleep to avoid busy waiting
-                    continue;
-                }
-                _ = shutdown.recv() => break,
-            }
+        if let Err(error) = writer.write_all(&pipeline_message[..byte_count]).await {
+            log_error!(stats, config, "Write error: {}", error);
+            stats.record_connection_error();
+            return Ok(());
         }
-    } else {
-        // Original message sending loop
-        loop {
-            if let Some(end) = end_time {
-                if Instant::now() >= end {
-                    break;
-                }
+        pacer.advance(message_count);
+    }
+}
+
+async fn pipeline_reader(
+    mut reader: OwnedReadHalf,
+    config: &Config,
+    stats: &Stats,
+    mut sent_rx: mpsc::UnboundedReceiver<SentBatch>,
+) -> Result<(), TcpKaliError> {
+    let message_size = config
+        .message
+        .as_ref()
+        .expect("Message must be provided")
+        .len();
+    let mut buffer = vec![0; PIPELINE_READ_BUFFER_BYTES.max(message_size)];
+    let mut partial_response_bytes = 0usize;
+    let mut current_batch: Option<SentBatch> = None;
+    let mut local_stats = LocalStatsCache::new(stats);
+
+    loop {
+        let bytes_read = match reader.read(&mut buffer).await {
+            Ok(0) => return Ok(()),
+            Ok(bytes_read) => bytes_read,
+            Err(error) => {
+                log_error!(stats, config, "Read error: {}", error);
+                stats.record_connection_error();
+                return Ok(());
             }
+        };
 
-            tokio::select! {
-                _ = async {
-                    if stats.is_shutting_down() {
-                        return;
-                    }
+        let available = partial_response_bytes + bytes_read;
+        let mut response_count = available / message_size;
+        partial_response_bytes = available % message_size;
 
-                    // Record send time before actual write
-                    let send_time = Instant::now();
-                    sent_times.push(send_time);
+        while response_count > 0 {
+            let mut batch = match current_batch.take() {
+                Some(batch) => batch,
+                None => match sent_rx.recv().await {
+                    Some(batch) => batch,
+                    None => return Ok(()),
+                },
+            };
 
-                    // Perform write operation immediately
-                    // Use write instead of write_all to reduce system calls overhead
-                    match writer.write(message).await {
-                        Ok(n) if n == message.len() => {
-                            // Successfully wrote complete message
-                        }
-                        Ok(_) => {
-                            if !stats.is_shutting_down() && !config.quiet {
-                                eprintln!("Partial write");
-                            }
-                            stats.record_connection_error();
-                            return;
-                        }
-                        Err(e) => {
-                            if !stats.is_shutting_down() && !config.quiet {
-                                eprintln!("Write error: {}", e);
-                            }
-                            stats.record_connection_error();
-                            return;
-                        }
-                    }
+            let count = response_count.min(batch.remaining);
+            local_stats.record_responses(
+                count,
+                message_size,
+                message_size,
+                batch.sent_at.elapsed().as_micros().max(1) as u64,
+            );
+            response_count -= count;
 
-                    counter += 1;
-                    // Time-based yield: check every 10ms if yield is needed
-                    if last_yield_time.elapsed() >= YIELD_INTERVAL {
-                        tokio::task::yield_now().await;
-                        last_yield_time = Instant::now();
-                    }
-
-                    if let Some(rate) = config.message_rate {
-                        if rate > 0 {
-                            let target_duration = Duration::from_secs_f64(1.0 / rate as f64);
-                            let elapsed = send_time.elapsed();
-                            if elapsed < target_duration {
-                                time::sleep(target_duration - elapsed).await;
-                            }
-                        }
-                        // If rate == 0, no rate control
-                    }
-                } => {},
-                _ = shutdown.recv() => break,
+            batch.remaining -= count;
+            if batch.remaining > 0 {
+                current_batch = Some(batch);
             }
         }
     }
+}
 
-    // Clean up reader task
-    drop(writer);
-    let _ = reader_handle.await;
+#[cfg(test)]
+mod tests {
+    use super::tcp_worker;
+    use crate::command::Config;
+    use crate::stats::Stats;
+    use bytes::Bytes;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
-    stats.success_connections.fetch_add(1, Ordering::Relaxed);
-    Ok(())
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipeline_echo_batches_io_and_flushes_stats_on_cancel() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 16 * 1024];
+            loop {
+                let bytes_read = stream.read(&mut buffer).await.unwrap();
+                if bytes_read == 0 {
+                    break;
+                }
+                stream.write_all(&buffer[..bytes_read]).await.unwrap();
+            }
+        });
+
+        let payload = Bytes::from_static(b"echo payload");
+        let messages_per_batch = 64;
+        let pipeline_message = Bytes::from(payload.as_ref().repeat(messages_per_batch));
+        let config = Arc::new(Config {
+            duration: Duration::from_millis(200),
+            warmup_duration: Duration::ZERO,
+            message_size: payload.len(),
+            quiet: true,
+            nagle: false,
+            pipeline: true,
+            connections: 1,
+            connect_rate: 0,
+            connect_timeout: Duration::from_secs(1),
+            channel_lifetime: None,
+            first_message: None,
+            message: Some(payload),
+            pipeline_message: Some(pipeline_message),
+            pipeline_batch_size: messages_per_batch,
+            message_rate: Some(64_000),
+            use_websocket: false,
+            output: None,
+        });
+        let stats = Arc::new(Stats::new());
+        stats.end_warmup();
+
+        let worker_stats = stats.clone();
+        let (_load_start_tx, load_start_rx) = tokio::sync::watch::channel(true);
+        let worker = tokio::spawn(async move {
+            tcp_worker(
+                &address.to_string(),
+                config,
+                worker_stats,
+                load_start_rx,
+                None,
+            )
+            .await
+            .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stats.total_requests.load(Ordering::Relaxed) < 2_000 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("TCP echo worker did not produce responses");
+        worker.abort();
+        let _ = worker.await;
+        server.abort();
+        let _ = server.await;
+
+        let responses = stats.total_requests.load(Ordering::Relaxed);
+        assert!(responses >= 2_000, "only recorded {responses} responses");
+        assert!(
+            responses <= 10_000,
+            "rate limiter allowed {responses} responses"
+        );
+    }
 }

@@ -3,52 +3,195 @@ use hdrhistogram::Histogram;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Local statistics cache for batch updates to reduce atomic operations
-#[derive(Default, Clone, Debug)]
-#[allow(dead_code)]
-pub struct LocalStatsCache {
-    /// Local request count
-    pub requests: u64,
-    /// Local bytes sent
-    pub bytes_sent: u64,
-    /// Local bytes received
-    pub bytes_received: u64,
+const REQUEST_FLUSH_THRESHOLD: u64 = 256;
+const LATENCY_FLUSH_THRESHOLD: usize = 1;
+const LATENCY_SAMPLE_MASK: u64 = 0xFF;
+
+pub(crate) fn rate_per_second(total: u64, duration: Duration) -> f64 {
+    if duration.is_zero() {
+        0.0
+    } else {
+        total as f64 / duration.as_secs_f64()
+    }
 }
 
-#[allow(dead_code)]
-impl LocalStatsCache {
+pub(crate) fn megabits_per_second(total_bytes: u64, duration: Duration) -> f64 {
+    rate_per_second(total_bytes.saturating_mul(8), duration) / 1_000_000.0
+}
+
+/// Per-connection statistics buffer. Drop flushes the last partial batch when a
+/// worker is cancelled by the benchmark supervisor.
+pub struct LocalStatsCache<'a> {
+    stats: &'a Stats,
+    /// Local request count
+    requests: u64,
+    /// Local bytes sent
+    bytes_sent: u64,
+    /// Local bytes received
+    bytes_received: u64,
+    response_sequence: u64,
+    latency_samples: Vec<u64>,
+}
+
+impl<'a> LocalStatsCache<'a> {
     /// Create new local cache
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Record request to local cache
-    pub fn record_request(&mut self, bytes_sent: usize, bytes_received: usize) {
-        self.requests += 1;
-        self.bytes_sent += bytes_sent as u64;
-        self.bytes_received += bytes_received as u64;
-    }
-
-    /// Commit local cache to global statistics
-    pub fn commit_to(&self, stats: &Stats) {
-        if self.requests > 0 {
-            stats
-                .total_requests
-                .fetch_add(self.requests, Ordering::Relaxed);
-            stats
-                .total_bytes_sent
-                .fetch_add(self.bytes_sent, Ordering::Relaxed);
-            stats
-                .total_bytes_received
-                .fetch_add(self.bytes_received, Ordering::Relaxed);
+    pub fn new(stats: &'a Stats) -> Self {
+        Self {
+            stats,
+            requests: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            response_sequence: 0,
+            latency_samples: Vec::with_capacity(LATENCY_FLUSH_THRESHOLD),
         }
     }
 
-    /// Reset local cache
-    pub fn reset(&mut self) {
+    /// Records responses with one warmup check and no global atomic updates on
+    /// the common path. A single latency value represents responses read from
+    /// the same pipeline batch.
+    pub fn record_responses(
+        &mut self,
+        count: usize,
+        bytes_sent_per_response: usize,
+        bytes_received_per_response: usize,
+        latency_us: u64,
+    ) {
+        if self.stats.is_warmup() {
+            self.clear();
+            return;
+        }
+
+        let count = count as u64;
+        let previous_sequence = self.response_sequence;
+        self.response_sequence = self.response_sequence.saturating_add(count);
+        self.requests = self.requests.saturating_add(count);
+        self.bytes_sent = self
+            .bytes_sent
+            .saturating_add((bytes_sent_per_response as u64).saturating_mul(count));
+        self.bytes_received = self
+            .bytes_received
+            .saturating_add((bytes_received_per_response as u64).saturating_mul(count));
+
+        let samples = (self.response_sequence >> 8) - (previous_sequence >> 8);
+        self.latency_samples
+            .extend(std::iter::repeat_n(latency_us, samples as usize));
+
+        if self.requests >= REQUEST_FLUSH_THRESHOLD {
+            self.flush_counters();
+        }
+        if self.latency_samples.len() >= LATENCY_FLUSH_THRESHOLD {
+            self.flush_latencies();
+        }
+    }
+
+    /// Commit local cache to global statistics
+    pub fn flush(&mut self) {
+        self.flush_counters();
+        self.flush_latencies();
+    }
+
+    fn flush_counters(&mut self) {
+        if self.requests > 0 {
+            self.stats
+                .total_requests
+                .fetch_add(self.requests, Ordering::Relaxed);
+            self.stats
+                .total_bytes_sent
+                .fetch_add(self.bytes_sent, Ordering::Relaxed);
+            self.stats
+                .total_bytes_received
+                .fetch_add(self.bytes_received, Ordering::Relaxed);
+        }
+
         self.requests = 0;
         self.bytes_sent = 0;
         self.bytes_received = 0;
+    }
+
+    fn flush_latencies(&mut self) {
+        if !self.latency_samples.is_empty() {
+            let mut histogram = self.stats.latency_histogram.lock();
+            for latency_us in self.latency_samples.drain(..) {
+                if let Err(error) = histogram.record(latency_us)
+                    && !self.stats.is_shutting_down()
+                {
+                    eprintln!("Failed to record latency: {}", error);
+                }
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.requests = 0;
+        self.bytes_sent = 0;
+        self.bytes_received = 0;
+        self.response_sequence = 0;
+        self.latency_samples.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LocalStatsCache, Stats, megabits_per_second, rate_per_second};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    #[test]
+    fn local_cache_flushes_counters_and_latency_on_drop() {
+        let stats = Stats::new();
+        stats.end_warmup();
+
+        {
+            let mut cache = LocalStatsCache::new(&stats);
+            cache.record_responses(256, 10, 20, 42);
+            cache.record_responses(3, 10, 20, 84);
+        }
+
+        assert_eq!(stats.total_requests.load(Ordering::Relaxed), 259);
+        assert_eq!(stats.total_bytes_sent.load(Ordering::Relaxed), 2_590);
+        assert_eq!(stats.total_bytes_received.load(Ordering::Relaxed), 5_180);
+        let histogram = stats.latency_histogram.lock();
+        assert_eq!(histogram.len(), 1);
+        assert_eq!(histogram.value_at_percentile(50.0), 42);
+    }
+
+    #[test]
+    fn local_cache_does_not_carry_warmup_data_into_benchmark() {
+        let stats = Stats::new();
+        let mut cache = LocalStatsCache::new(&stats);
+        cache.record_responses(100, 10, 20, 42);
+        stats.end_warmup();
+        cache.record_responses(1, 10, 20, 84);
+        drop(cache);
+
+        assert_eq!(stats.total_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn connection_error_rate_uses_connection_attempts() {
+        let stats = Stats::new();
+        stats.total_connections.store(4, Ordering::Relaxed);
+        stats.connection_errors.store(3, Ordering::Relaxed);
+
+        assert_eq!(stats.connection_error_rate(), 75.0);
+    }
+
+    #[test]
+    fn rates_are_normalized_by_duration() {
+        let duration = Duration::from_secs(2);
+        assert_eq!(rate_per_second(1_000, duration), 500.0);
+        assert_eq!(megabits_per_second(1_000_000, duration), 4.0);
+        assert_eq!(rate_per_second(1_000, Duration::ZERO), 0.0);
+    }
+}
+
+impl Drop for LocalStatsCache<'_> {
+    fn drop(&mut self) {
+        if self.stats.is_warmup() {
+            self.clear();
+        } else {
+            self.flush();
+        }
     }
 }
 
@@ -113,7 +256,7 @@ impl Stats {
     pub fn record_latency(&self, latency_us: u64, sample_count: usize) {
         // Optimize sampling strategy: use bit operations to check if it's a multiple of a power of two, reducing branch prediction failures
         // Increase sampling interval to 256 to reduce lock contention
-        if (sample_count & 0xFF) == 0 && !self.is_warmup() {
+        if (sample_count as u64 & LATENCY_SAMPLE_MASK) == 0 && !self.is_warmup() {
             let mut hist = self.latency_histogram.lock();
             hist.record(latency_us).unwrap_or_else(|e| {
                 if !self.is_shutting_down() {
@@ -138,27 +281,20 @@ impl Stats {
         }
     }
 
-    /// Batch record request data (using local cache)
-    ///
-    /// # Arguments
-    /// * `cache` - Local statistics cache
-    #[allow(dead_code)]
-    pub fn record_request_batch(&self, cache: &LocalStatsCache) {
-        if !self.is_warmup() && cache.requests > 0 {
-            self.total_requests
-                .fetch_add(cache.requests, Ordering::Relaxed);
-            self.total_bytes_sent
-                .fetch_add(cache.bytes_sent, Ordering::Relaxed);
-            self.total_bytes_received
-                .fetch_add(cache.bytes_received, Ordering::Relaxed);
-        }
-    }
-
     /// Record connection error
     ///
     /// Increments the connection error counter by one.
     pub fn record_connection_error(&self) {
         self.connection_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn connection_error_rate(&self) -> f64 {
+        let total_connections = self.total_connections.load(Ordering::Relaxed);
+        if total_connections == 0 {
+            0.0
+        } else {
+            self.connection_errors.load(Ordering::Relaxed) as f64 / total_connections as f64 * 100.0
+        }
     }
 
     /// End warmup phase
@@ -237,11 +373,7 @@ impl Stats {
         let total_bytes_received = stats.total_bytes_received.load(Ordering::Relaxed);
         let total_bytes = total_bytes_sent + total_bytes_received;
         let total_requests = stats.total_requests.load(Ordering::Relaxed);
-        let qps = if duration.as_secs_f64() > 0.0 {
-            total_requests as f64 / duration.as_secs_f64()
-        } else {
-            0.0
-        };
+        let qps = rate_per_second(total_requests, duration);
         let success_connections = stats.success_connections.load(Ordering::Relaxed) as f64;
         let total_connections = stats.total_connections.load(Ordering::Relaxed) as f64;
         let success_rate = if total_connections > 0.0 {
@@ -249,23 +381,19 @@ impl Stats {
         } else {
             0.0
         };
-        let error_rate = if total_requests > 0 {
-            stats.connection_errors.load(Ordering::Relaxed) as f64 / total_requests as f64 * 100.0
-        } else {
-            0.0
-        };
-        let bandwidth = if duration.as_secs_f64() > 0.0 {
-            total_bytes as f64 / duration.as_secs_f64() / 1_000_000.0
-        } else {
-            0.0
-        };
+        let connection_errors = stats.connection_errors.load(Ordering::Relaxed);
+        let connection_error_rate = stats.connection_error_rate();
+        let bandwidth = rate_per_second(total_bytes, duration) / 1_000_000.0;
+        let traffic_down_mbps = megabits_per_second(total_bytes_received, duration);
+        let traffic_up_mbps = megabits_per_second(total_bytes_sent, duration);
 
         println!("\n=== Final Results ===");
         println!("Duration:          {:.2}s", duration.as_secs_f64());
         println!("Total Connections: {}", total_connections);
         println!("Success Rate:      {:.1}%", success_rate);
         println!("Total Requests:    {}", total_requests);
-        println!("Error Rate:        {:.2}%", error_rate);
+        println!("Connection Errors: {}", connection_errors);
+        println!("Connection Error Rate: {:.2}%", connection_error_rate);
         println!("Requests Rate:     {:.2} req/s", qps,);
         println!(
             "Throughput:        {:.2} MB",
@@ -274,8 +402,7 @@ impl Stats {
         println!("Bandwidth:         {:.2} MB/s", bandwidth);
         println!(
             "Traffic:           {:.2}↓, {:.2}↑ Mbps",
-            total_bytes_received * 8 / 1000000,
-            total_bytes_sent * 8 / 1000000
+            traffic_down_mbps, traffic_up_mbps
         );
         println!("Latency Distribution (us):");
         println!("  Avg: {:8.1}  Min: {:8}", hist.mean(), hist.min());

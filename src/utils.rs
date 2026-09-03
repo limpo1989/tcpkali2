@@ -1,7 +1,87 @@
 use bytes::Bytes;
-use rand::Rng;
+use rand::RngExt;
 use rand::distr::Alphanumeric;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const RATE_BATCH_INTERVALS_PER_SECOND: u64 = 200;
+
+/// Absolute-deadline rate pacer. Falling behind does not accumulate sleep drift.
+pub(crate) struct RatePacer {
+    rate: Option<u64>,
+    started_at: tokio::time::Instant,
+    sent: u64,
+}
+
+impl RatePacer {
+    pub(crate) fn new(rate: Option<u64>) -> Self {
+        Self {
+            rate: rate.filter(|rate| *rate > 0),
+            started_at: tokio::time::Instant::now(),
+            sent: 0,
+        }
+    }
+
+    /// Use roughly one batch per 5ms for rate-limited pipeline traffic. This
+    /// keeps pacing smooth without paying for a timer wakeup per message.
+    pub(crate) fn batch_size(&self, maximum: usize) -> usize {
+        match self.rate {
+            Some(rate) => (rate / RATE_BATCH_INTERVALS_PER_SECOND)
+                .max(1)
+                .min(maximum as u64) as usize,
+            None => maximum,
+        }
+    }
+
+    pub(crate) async fn wait(&self) {
+        let Some(rate) = self.rate else {
+            return;
+        };
+
+        let deadline = self.started_at + duration_for_count(self.sent, rate);
+        tokio::time::sleep_until(deadline).await;
+    }
+
+    pub(crate) fn advance(&mut self, count: usize) {
+        self.sent = self.sent.saturating_add(count as u64);
+    }
+}
+
+/// Calculates count/rate without floating-point drift or nanosecond overflow.
+pub(crate) fn duration_for_count(count: u64, rate: u64) -> Duration {
+    debug_assert!(rate > 0);
+    let seconds = count / rate;
+    let remainder = count % rate;
+    let nanos = (remainder as u128 * 1_000_000_000u128 / rate as u128) as u32;
+    Duration::new(seconds, nanos)
+}
+
+/// Holds established connections idle until the runner starts warmup traffic.
+pub(crate) async fn wait_for_load_start(mut load_start: tokio::sync::watch::Receiver<bool>) {
+    while !*load_start.borrow_and_update() {
+        if load_start.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Waits for the benchmark phase before starting a connection lifetime timer.
+/// The watch channel is observed once per connection, never per message.
+pub(crate) async fn wait_for_benchmark_lifetime(
+    mut benchmark_start: tokio::sync::watch::Receiver<Option<tokio::time::Instant>>,
+    lifetime: Duration,
+) {
+    loop {
+        let started_at = *benchmark_start.borrow_and_update();
+        if let Some(started_at) = started_at {
+            tokio::time::sleep_until(started_at + lifetime).await;
+            return;
+        }
+
+        if benchmark_start.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
 
 /// Parse duration string
 ///
@@ -223,4 +303,35 @@ pub fn unix_timestamp_millis() -> u64 {
     now.duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{duration_for_count, wait_for_load_start};
+    use std::time::Duration;
+
+    #[test]
+    fn rate_deadline_is_exact_for_whole_intervals() {
+        assert_eq!(duration_for_count(1_000, 1_000), Duration::from_secs(1));
+        assert_eq!(duration_for_count(50, 100), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn rate_deadline_supports_sub_millisecond_intervals() {
+        assert_eq!(duration_for_count(1, 10_000), Duration::from_micros(100));
+    }
+
+    #[tokio::test]
+    async fn load_start_waits_for_the_runner_signal() {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let waiter = tokio::spawn(wait_for_load_start(receiver));
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        sender.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("load start waiter did not wake")
+            .unwrap();
+    }
 }

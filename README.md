@@ -50,7 +50,7 @@ Options:
       --connect-timeout <T>          Limit time spent in a connection attempt [default: 1s]
       --channel-lifetime <T>         Shut down each connection after T seconds
   -w, --workers <N>                  Number of Tokio worker threads to use [default: 8]
-      --nagle                        Control Nagle algorithm (set TCP_NODELAY)
+      --nagle                        Enable Nagle's algorithm (TCP_NODELAY is enabled by default)
   -p, --pipeline                     Use pipeline client to send messages
   -T, --duration <T>                 Load test for the specified amount of time [default: 15s]
       --warmup <T>                   Warmup duration before benchmark (0 to skip) [default: 5s]
@@ -125,11 +125,12 @@ Duration:          15.01s
 Total Connections: 200
 Success Rate:      100.0%
 Total Requests:    23478241
-Error Rate:        0.00%
+Connection Errors: 0
+Connection Error Rate: 0.00%
 Requests Rate:     1563978.19 req/s
 Throughput:        6010.43 MB
 Bandwidth:         400.38 MB/s
-Traffic:           24041↓, 24041↑ Mbps
+Traffic:           1601.52↓, 1601.52↑ Mbps
 Latency Distribution (us):
   Avg:   6687.3  Min:       53
   P50:     4719  P90:    13287
@@ -140,3 +141,7 @@ Latency Distribution (us):
 ## License
 
 The repository released under version 2.0 of the Apache License.
+
+## Releasing
+
+See [RELEASING.md](RELEASING.md) for the gated release process.

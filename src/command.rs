@@ -1,9 +1,12 @@
 use crate::error::TcpKaliError;
 use crate::utils::{generate_payload, get_file_arg, get_message_arg, parse_duration, parse_rate};
 use bytes::Bytes;
-use clap::{value_parser, Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, value_parser};
 use std::sync::Arc;
 use std::time::Duration;
+
+const MAX_PIPELINE_BATCH_BYTES: usize = 8 * 1024;
+const MAX_PIPELINE_BATCH_MESSAGES: usize = 256;
 
 /// Load test configuration
 /// Uses 64-byte alignment to optimize cache line efficiency
@@ -34,6 +37,10 @@ pub struct Config {
     pub first_message: Option<Bytes>,
     /// Test message
     pub message: Option<Bytes>,
+    /// Repeated TCP payload shared by all pipeline connections
+    pub pipeline_message: Option<Bytes>,
+    /// Number of protocol messages in `pipeline_message`
+    pub pipeline_batch_size: usize,
     /// Message sending rate (messages per second)
     pub message_rate: Option<u64>,
     /// Whether WebSocket is used
@@ -54,6 +61,11 @@ pub fn parse_config(matches: &clap::ArgMatches) -> Result<Arc<Config>, TcpKaliEr
 
     let message_size = *matches.get_one::<usize>("message-size").unwrap();
 
+    let message = get_message_arg(matches, "message", unescape)
+        .or_else(|| get_file_arg(matches, "message-file", unescape))
+        .or_else(|| generate_payload(message_size));
+    let (pipeline_message, pipeline_batch_size) = build_pipeline_message(message.as_ref());
+
     let config = Config {
         duration: *matches.get_one::<Duration>("duration").unwrap(),
         warmup_duration: *matches.get_one::<Duration>("warmup").unwrap(),
@@ -66,9 +78,9 @@ pub fn parse_config(matches: &clap::ArgMatches) -> Result<Arc<Config>, TcpKaliEr
         channel_lifetime: matches.get_one::<Duration>("channel-lifetime").cloned(),
         first_message: get_message_arg(matches, "first-message", unescape)
             .or_else(|| get_file_arg(matches, "first-message-file", unescape)),
-        message: get_message_arg(matches, "message", unescape)
-            .or_else(|| get_file_arg(matches, "message-file", unescape))
-            .or_else(|| generate_payload(message_size)),
+        message,
+        pipeline_message,
+        pipeline_batch_size,
         message_size,
         message_rate: matches.get_one::<u64>("message-rate").cloned(),
         use_websocket: matches.get_flag("websocket"),
@@ -91,15 +103,36 @@ pub fn parse_config(matches: &clap::ArgMatches) -> Result<Arc<Config>, TcpKaliEr
             "duration must be greater than 0".into(),
         ));
     }
-    if let Some(lifetime) = config.channel_lifetime {
-        if lifetime.as_secs_f64() == 0.0 {
-            return Err(TcpKaliError::Config(
-                "channel-lifetime must be greater than 0 if specified".into(),
-            ));
-        }
+    if let Some(lifetime) = config.channel_lifetime
+        && lifetime.is_zero()
+    {
+        return Err(TcpKaliError::Config(
+            "channel-lifetime must be greater than 0 if specified".into(),
+        ));
     }
 
     Ok(Arc::new(config))
+}
+
+fn build_pipeline_message(message: Option<&Bytes>) -> (Option<Bytes>, usize) {
+    let Some(message) = message else {
+        return (None, 1);
+    };
+    if message.is_empty() {
+        return (Some(Bytes::new()), 1);
+    }
+
+    let messages_per_batch =
+        (MAX_PIPELINE_BATCH_BYTES / message.len()).clamp(1, MAX_PIPELINE_BATCH_MESSAGES);
+    if messages_per_batch == 1 {
+        return (Some(message.clone()), 1);
+    }
+
+    let mut batch = Vec::with_capacity(message.len() * messages_per_batch);
+    for _ in 0..messages_per_batch {
+        batch.extend_from_slice(message);
+    }
+    (Some(Bytes::from(batch)), messages_per_batch)
 }
 
 /// Create command line argument parser
@@ -168,7 +201,7 @@ pub fn new_command() -> clap::ArgMatches {
             Arg::new("nagle")
                 .long("nagle")
                 .action(ArgAction::SetTrue)
-                .help("Control Nagle algorithm (set TCP_NODELAY)"),
+                .help("Enable Nagle's algorithm (TCP_NODELAY is enabled by default)"),
         )
         .arg(
             Arg::new("pipeline")

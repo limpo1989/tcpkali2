@@ -1,5 +1,5 @@
 use crate::command::Config;
-use crate::stats::Stats;
+use crate::stats::{Stats, megabits_per_second, rate_per_second};
 use std::fs;
 use std::io::{BufRead, Write};
 use std::sync::atomic::Ordering;
@@ -24,7 +24,8 @@ const HEADERS: &[&str] = &[
     "total_connections",
     "success_rate_pct",
     "total_requests",
-    "error_rate_pct",
+    "connection_errors",
+    "connection_error_rate_pct",
     "requests_per_sec",
     "throughput_mb",
     "bandwidth_mb_s",
@@ -57,13 +58,7 @@ fn build_row(
     let total_bytes_received = stats.total_bytes_received.load(Ordering::Relaxed);
     let total_bytes = total_bytes_sent + total_bytes_received;
     let total_requests = stats.total_requests.load(Ordering::Relaxed);
-    let elapsed = duration.as_secs_f64();
-
-    let qps = if elapsed > 0.0 {
-        total_requests as f64 / elapsed
-    } else {
-        0.0
-    };
+    let qps = rate_per_second(total_requests, duration);
 
     let total_connections = stats.total_connections.load(Ordering::Relaxed) as f64;
     let success_connections = stats.success_connections.load(Ordering::Relaxed) as f64;
@@ -73,17 +68,11 @@ fn build_row(
         0.0
     };
 
-    let error_rate = if total_requests > 0 {
-        stats.connection_errors.load(Ordering::Relaxed) as f64 / total_requests as f64 * 100.0
-    } else {
-        0.0
-    };
-
-    let bandwidth = if elapsed > 0.0 {
-        total_bytes as f64 / elapsed / 1_000_000.0
-    } else {
-        0.0
-    };
+    let connection_errors = stats.connection_errors.load(Ordering::Relaxed);
+    let connection_error_rate = stats.connection_error_rate();
+    let bandwidth = rate_per_second(total_bytes, duration) / 1_000_000.0;
+    let traffic_down_mbps = megabits_per_second(total_bytes_received, duration);
+    let traffic_up_mbps = megabits_per_second(total_bytes_sent, duration);
 
     // Get current UTC timestamp in RFC 3339 format without external crate
     let timestamp = {
@@ -122,17 +111,22 @@ fn build_row(
         config.nagle.to_string(),
         config.pipeline.to_string(),
         config.use_websocket.to_string(),
-        config.message_size.to_string(),
+        config
+            .message
+            .as_ref()
+            .map_or(config.message_size, bytes::Bytes::len)
+            .to_string(),
         message_rate_str,
         format!("{}", total_connections),
         format!("{:.1}", success_rate),
         total_requests.to_string(),
-        format!("{:.2}", error_rate),
+        connection_errors.to_string(),
+        format!("{:.2}", connection_error_rate),
         format!("{:.2}", qps),
         format!("{:.2}", total_bytes as f64 / 1_000_000.0),
         format!("{:.2}", bandwidth),
-        format!("{:.2}", total_bytes_received * 8 / 1_000_000),
-        format!("{:.2}", total_bytes_sent * 8 / 1_000_000),
+        format!("{:.2}", traffic_down_mbps),
+        format!("{:.2}", traffic_up_mbps),
         format!("{:.1}", hist.mean()),
         format!("{}", hist.min()),
         format!("{}", hist.value_at_percentile(50.0)),
@@ -184,7 +178,7 @@ fn epoch_to_datetime(epoch: u64) -> (u64, u64, u64, u64, u64, u64) {
 }
 
 fn is_leap(year: u64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 /// Export benchmark results to a CSV file.
@@ -206,13 +200,13 @@ pub fn export_csv(
     if let Ok(file) = fs::File::open(path) {
         // File exists — check if headers match
         let reader = std::io::BufReader::new(file);
-        if let Some(Ok(first_line)) = reader.lines().next() {
-            if first_line.trim() == expected_header {
-                // Headers match — append
-                if let Ok(mut f) = fs::OpenOptions::new().append(true).open(path) {
-                    let _ = writeln!(f, "{}", row);
-                    return;
-                }
+        if let Some(Ok(first_line)) = reader.lines().next()
+            && first_line.trim() == expected_header
+        {
+            // Headers match - append
+            if let Ok(mut f) = fs::OpenOptions::new().append(true).open(path) {
+                let _ = writeln!(f, "{}", row);
+                return;
             }
         }
         // Headers don't match or couldn't read — fall through to overwrite
@@ -222,5 +216,59 @@ pub fn export_csv(
     if let Ok(mut f) = fs::File::create(path) {
         let _ = writeln!(f, "{}", expected_header);
         let _ = writeln!(f, "{}", row);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HEADERS, build_row};
+    use crate::command::Config;
+    use crate::stats::Stats;
+    use bytes::Bytes;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    #[test]
+    fn csv_row_uses_consistent_error_and_rate_units() {
+        let payload = Bytes::from_static(b"abc");
+        let config = Config {
+            duration: Duration::from_secs(2),
+            warmup_duration: Duration::ZERO,
+            message_size: 128,
+            quiet: true,
+            nagle: false,
+            pipeline: false,
+            connections: 4,
+            connect_rate: 0,
+            connect_timeout: Duration::from_secs(1),
+            channel_lifetime: None,
+            first_message: None,
+            message: Some(payload.clone()),
+            pipeline_message: Some(payload),
+            pipeline_batch_size: 1,
+            message_rate: None,
+            use_websocket: false,
+            output: None,
+        };
+        let stats = Stats::new();
+        stats.total_connections.store(4, Ordering::Relaxed);
+        stats.success_connections.store(1, Ordering::Relaxed);
+        stats.connection_errors.store(3, Ordering::Relaxed);
+        stats.total_requests.store(10, Ordering::Relaxed);
+        stats
+            .total_bytes_received
+            .store(1_000_000, Ordering::Relaxed);
+        stats.total_bytes_sent.store(2_000_000, Ordering::Relaxed);
+
+        let row = build_row(&config, &stats, Duration::from_secs(2), "localhost:1", 1);
+        let values: Vec<_> = row.split(',').collect();
+        assert_eq!(values.len(), HEADERS.len());
+
+        let value = |header: &str| values[HEADERS.iter().position(|item| *item == header).unwrap()];
+        assert_eq!(value("message_size"), "3");
+        assert_eq!(value("connection_errors"), "3");
+        assert_eq!(value("connection_error_rate_pct"), "75.00");
+        assert_eq!(value("traffic_down_mbps"), "4.00");
+        assert_eq!(value("traffic_up_mbps"), "8.00");
     }
 }

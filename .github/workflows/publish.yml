@@ -1,48 +1,228 @@
-name: Build and Publish
+name: CI and Release
 
 on:
+  pull_request:
   push:
+    branches:
+      - master
     tags:
       - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
+  quality:
+    name: Format, lint, test, and package
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          components: rustfmt, clippy
 
-      - name: Build
-        run: cargo build --verbose
+      - name: Verify release tag matches Cargo version
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [[ "$GITHUB_REF_NAME" != "v${package_version}" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo version v${package_version}"
+            exit 1
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --all-targets --locked
 
-        #- name: Run clippy
-        #run: cargo clippy --
+      - name: Verify crate package
+        run: cargo package --locked
 
-        #- name: Check formatting
-        #run: cargo fmt --
-
-  publish:
-    name: Publish
-    needs: test
-    runs-on: ubuntu-latest
+  msrv:
+    name: Check MSRV (Rust 1.88)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
+
+      - name: Check all targets with MSRV
+        run: cargo check --all-targets --locked
+
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    needs:
+      - quality
+      - msrv
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: tcpkali2
+            archive: tcpkali2-x86_64-unknown-linux-gnu.tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            binary: tcpkali2
+            archive: tcpkali2-aarch64-apple-darwin.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: tcpkali2.exe
+            archive: tcpkali2-x86_64-pc-windows-msvc.zip
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/${{ matrix.archive }}" "${{ matrix.binary }}"
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary }}" -DestinationPath "dist/${{ matrix.archive }}"
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 14
+
+  prepare-release:
+    name: Prepare draft GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - quality
+      - msrv
+      - build-binaries
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: sha256sum dist/* > dist/SHA256SUMS
+
+      - name: Create or update draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft')"
+            if [[ "$is_draft" != "true" ]]; then
+              echo "::error::Release $GITHUB_REF_NAME already exists and is not a draft"
+              exit 1
+            fi
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --draft \
+              --verify-tag \
+              --generate-notes \
+              --title "$GITHUB_REF_NAME"
+          fi
+
+  publish-crate:
+    name: Publish crate
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - prepare-release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Publish to crates.io
-        shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --token "$CARGO_REGISTRY_TOKEN"
+        shell: bash
+        run: |
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not configured"
+            exit 1
+          fi
+          cargo publish --locked --token "$CARGO_REGISTRY_TOKEN"
+
+  finalize-release:
+    name: Publish GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - publish-crate
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Publish draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false
+
+  cleanup-failed-release:
+    name: Remove draft after failed crate publish
+    if: >-
+      ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+          needs.prepare-release.result == 'success' && needs.publish-crate.result != 'success' }}
+    needs:
+      - prepare-release
+      - publish-crate
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Remove draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          if [[ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft' 2>/dev/null)" == "true" ]]; then
+            gh release delete "$GITHUB_REF_NAME" --yes
+          fi
