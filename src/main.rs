@@ -7,7 +7,7 @@ mod tcp_worker;
 mod utils;
 mod websocket_worker;
 
-use crate::command::new_command;
+use crate::command::{new_command, worker_count};
 use crate::error::TcpKaliError;
 use crate::runner::async_main;
 
@@ -17,7 +17,7 @@ use crate::runner::async_main;
 /// * `Result<(), TcpKaliError>` - Execution result
 fn main() -> Result<(), TcpKaliError> {
     let matches = new_command();
-    let workers = *matches.get_one::<usize>("workers").unwrap();
+    let workers = worker_count(&matches);
     if workers == 0 {
         return Err(TcpKaliError::Config(
             "workers must be greater than 0".into(),

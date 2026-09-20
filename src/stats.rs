@@ -1,10 +1,11 @@
 use crate::utils::unix_timestamp_millis;
 use hdrhistogram::Histogram;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const REQUEST_FLUSH_THRESHOLD: u64 = 256;
-const LATENCY_FLUSH_THRESHOLD: usize = 1;
+const LATENCY_FLUSH_THRESHOLD: usize = 64;
+const LATENCY_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const LATENCY_SAMPLE_MASK: u64 = 0xFF;
 
 pub(crate) fn rate_per_second(total: u64, duration: Duration) -> f64 {
@@ -30,7 +31,9 @@ pub struct LocalStatsCache<'a> {
     /// Local bytes received
     bytes_received: u64,
     response_sequence: u64,
-    latency_samples: Vec<u64>,
+    latency_samples: Vec<(u64, u64)>,
+    latency_sample_count: usize,
+    last_latency_flush: Instant,
 }
 
 impl<'a> LocalStatsCache<'a> {
@@ -43,6 +46,8 @@ impl<'a> LocalStatsCache<'a> {
             bytes_received: 0,
             response_sequence: 0,
             latency_samples: Vec::with_capacity(LATENCY_FLUSH_THRESHOLD),
+            latency_sample_count: 0,
+            last_latency_flush: Instant::now(),
         }
     }
 
@@ -73,13 +78,18 @@ impl<'a> LocalStatsCache<'a> {
             .saturating_add((bytes_received_per_response as u64).saturating_mul(count));
 
         let samples = (self.response_sequence >> 8) - (previous_sequence >> 8);
-        self.latency_samples
-            .extend(std::iter::repeat_n(latency_us, samples as usize));
+        if samples > 0 {
+            self.latency_samples.push((latency_us, samples));
+            self.latency_sample_count = self.latency_sample_count.saturating_add(samples as usize);
+        }
 
         if self.requests >= REQUEST_FLUSH_THRESHOLD {
             self.flush_counters();
         }
-        if self.latency_samples.len() >= LATENCY_FLUSH_THRESHOLD {
+        if samples > 0
+            && (self.latency_sample_count >= LATENCY_FLUSH_THRESHOLD
+                || self.last_latency_flush.elapsed() >= LATENCY_FLUSH_INTERVAL)
+        {
             self.flush_latencies();
         }
     }
@@ -110,14 +120,18 @@ impl<'a> LocalStatsCache<'a> {
 
     fn flush_latencies(&mut self) {
         if !self.latency_samples.is_empty() {
-            let mut histogram = self.stats.latency_histogram.lock();
-            for latency_us in self.latency_samples.drain(..) {
-                if let Err(error) = histogram.record(latency_us)
-                    && !self.stats.is_shutting_down()
-                {
-                    eprintln!("Failed to record latency: {}", error);
+            {
+                let mut histogram = self.stats.latency_histogram.lock();
+                for (latency_us, count) in self.latency_samples.drain(..) {
+                    if let Err(error) = histogram.record_n(latency_us, count)
+                        && !self.stats.is_shutting_down()
+                    {
+                        eprintln!("Failed to record latency: {}", error);
+                    }
                 }
             }
+            self.latency_sample_count = 0;
+            self.last_latency_flush = Instant::now();
         }
     }
 
@@ -127,12 +141,15 @@ impl<'a> LocalStatsCache<'a> {
         self.bytes_received = 0;
         self.response_sequence = 0;
         self.latency_samples.clear();
+        self.latency_sample_count = 0;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalStatsCache, Stats, megabits_per_second, rate_per_second};
+    use super::{
+        LATENCY_FLUSH_THRESHOLD, LocalStatsCache, Stats, megabits_per_second, rate_per_second,
+    };
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
@@ -165,6 +182,23 @@ mod tests {
         drop(cache);
 
         assert_eq!(stats.total_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn local_cache_batches_latency_histogram_updates() {
+        let stats = Stats::new();
+        stats.end_warmup();
+        let mut cache = LocalStatsCache::new(&stats);
+
+        for _ in 1..LATENCY_FLUSH_THRESHOLD {
+            cache.record_responses(256, 1, 1, 42);
+        }
+        assert!(stats.latency_histogram.lock().is_empty());
+
+        cache.record_responses(256, 1, 1, 42);
+        let histogram = stats.latency_histogram.lock();
+        assert_eq!(histogram.len(), LATENCY_FLUSH_THRESHOLD as u64);
+        assert_eq!(histogram.value_at_percentile(50.0), 42);
     }
 
     #[test]

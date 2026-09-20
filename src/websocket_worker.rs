@@ -1,4 +1,4 @@
-use crate::command::Config;
+use crate::command::{Config, pipeline_in_flight_batches};
 use crate::error::TcpKaliError;
 use crate::stats::{LocalStatsCache, Stats};
 use crate::utils::{RatePacer, wait_for_benchmark_lifetime, wait_for_load_start};
@@ -16,7 +16,6 @@ use tungstenite::Message;
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsWriter = SplitSink<WsStream, Message>;
 type WsReader = SplitStream<WsStream>;
-const MAX_IN_FLIGHT_BATCHES: usize = 4;
 
 macro_rules! log_error {
     ($stats:expr, $config:expr, $($arg:tt)*) => {
@@ -196,10 +195,8 @@ async fn run_pipeline(
     stats: &Stats,
 ) -> Result<(), TcpKaliError> {
     let (sent_tx, sent_rx) = mpsc::unbounded_channel();
-    let window = Arc::new(Semaphore::new(MAX_IN_FLIGHT_BATCHES));
-
     tokio::select! {
-        result = pipeline_writer(write, config, stats, sent_tx, window) => result,
+        result = pipeline_writer(write, config, stats, sent_tx) => result,
         result = pipeline_reader(read, config, stats, sent_rx) => result,
     }
 }
@@ -209,13 +206,16 @@ async fn pipeline_writer(
     config: &Config,
     stats: &Stats,
     sent_tx: mpsc::UnboundedSender<SentBatch>,
-    window: Arc<Semaphore>,
 ) -> Result<(), TcpKaliError> {
     let message = config.message.as_ref().expect("Message must be provided");
     let mut pacer = RatePacer::new(config.message_rate);
+    let message_count = pacer.batch_size(config.pipeline_batch_size);
+    let window = Arc::new(Semaphore::new(pipeline_in_flight_batches(
+        message.len(),
+        message_count,
+    )));
 
     loop {
-        let message_count = pacer.batch_size(config.pipeline_batch_size);
         pacer.wait().await;
         let permit = window
             .clone()

@@ -49,7 +49,7 @@ Options:
       --connect-rate <R>             Limit number of new connections per second [default: 100]
       --connect-timeout <T>          Limit time spent in a connection attempt [default: 1s]
       --channel-lifetime <T>         Shut down each connection after T seconds
-  -w, --workers <N>                  Number of Tokio worker threads to use [default: 8]
+  -w, --workers <N>                  Number of Tokio worker threads (default: max(1, logical CPUs / 2))
       --nagle                        Enable Nagle's algorithm (TCP_NODELAY is enabled by default)
   -p, --pipeline                     Use pipeline client to send messages
   -T, --duration <T>                 Load test for the specified amount of time [default: 15s]

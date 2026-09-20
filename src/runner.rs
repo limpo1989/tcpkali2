@@ -2,7 +2,7 @@
 //!
 //! Responsible for managing asynchronous task execution, statistics collection and result reporting
 
-use crate::command::Config;
+use crate::command::{Config, worker_count};
 use crate::error::TcpKaliError;
 use crate::stats::Stats;
 use crate::tcp_worker::tcp_worker;
@@ -27,7 +27,7 @@ pub async fn async_main(matches: clap::ArgMatches) -> Result<(), TcpKaliError> {
     let stats = Arc::new(Stats::new());
     let (load_start_tx, load_start_rx) = tokio::sync::watch::channel(false);
     let (benchmark_start_tx, benchmark_start_rx) = tokio::sync::watch::channel(None);
-    let workers = *matches.get_one::<usize>("workers").unwrap();
+    let workers = worker_count(&matches);
     // Collect targets for CSV export (use first target for the CSV row)
     let targets: Vec<String> = matches
         .get_many::<String>("host:port")

@@ -5,7 +5,11 @@ use clap::{Arg, ArgAction, Command, value_parser};
 use std::sync::Arc;
 use std::time::Duration;
 
-const MAX_PIPELINE_BATCH_BYTES: usize = 8 * 1024;
+// Larger batches reduce pipeline bookkeeping. The number of batches allowed
+// in flight is derived from the effective batch size below.
+pub(crate) const PIPELINE_BATCH_BYTES: usize = 16 * 1024;
+const PIPELINE_WINDOW_BYTES: usize = 32 * 1024;
+const PIPELINE_WINDOW_BATCHES: usize = 4;
 const MAX_PIPELINE_BATCH_MESSAGES: usize = 256;
 
 /// Load test configuration
@@ -114,6 +118,23 @@ pub fn parse_config(matches: &clap::ArgMatches) -> Result<Arc<Config>, TcpKaliEr
     Ok(Arc::new(config))
 }
 
+/// Returns the requested Tokio worker count, or half the logical CPUs when
+/// the command line leaves it unspecified.
+pub(crate) fn worker_count(matches: &clap::ArgMatches) -> usize {
+    matches
+        .get_one::<usize>("workers")
+        .copied()
+        .unwrap_or_else(default_worker_count)
+}
+
+fn default_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .saturating_div(2)
+        .max(1)
+}
+
 fn build_pipeline_message(message: Option<&Bytes>) -> (Option<Bytes>, usize) {
     let Some(message) = message else {
         return (None, 1);
@@ -123,7 +144,7 @@ fn build_pipeline_message(message: Option<&Bytes>) -> (Option<Bytes>, usize) {
     }
 
     let messages_per_batch =
-        (MAX_PIPELINE_BATCH_BYTES / message.len()).clamp(1, MAX_PIPELINE_BATCH_MESSAGES);
+        (PIPELINE_BATCH_BYTES / message.len()).clamp(1, MAX_PIPELINE_BATCH_MESSAGES);
     if messages_per_batch == 1 {
         return (Some(message.clone()), 1);
     }
@@ -135,11 +156,32 @@ fn build_pipeline_message(message: Option<&Bytes>) -> (Option<Bytes>, usize) {
     (Some(Bytes::from(batch)), messages_per_batch)
 }
 
+pub(crate) fn pipeline_in_flight_batches(message_size: usize, messages_per_batch: usize) -> usize {
+    let batch_bytes = message_size.saturating_mul(messages_per_batch);
+    if batch_bytes == 0 {
+        return 1;
+    }
+
+    // Preserve the old window of four 8 KiB batches. Rate-limited partial
+    // batches retain four permits, while full 16 KiB batches need only two.
+    let messages_per_window_batch = (PIPELINE_WINDOW_BYTES
+        .saturating_div(PIPELINE_WINDOW_BATCHES)
+        .saturating_div(message_size))
+    .clamp(1, MAX_PIPELINE_BATCH_MESSAGES)
+    .min(messages_per_batch);
+    let window_messages = messages_per_window_batch.saturating_mul(PIPELINE_WINDOW_BATCHES);
+    window_messages.div_ceil(messages_per_batch).max(1)
+}
+
 /// Create command line argument parser
 ///
 /// # Returns
 /// * `clap::ArgMatches` - Parsed command line arguments
 pub fn new_command() -> clap::ArgMatches {
+    command().get_matches()
+}
+
+fn command() -> Command {
     Command::new("tcpkali2")
         .version(env!("CARGO_PKG_VERSION"))
         .about("A load testing tool for WebSocket and TCP server")
@@ -193,9 +235,8 @@ pub fn new_command() -> clap::ArgMatches {
                 .short('w')
                 .long("workers")
                 .value_name("N")
-                .default_value("8")
                 .value_parser(value_parser!(usize))
-                .help("Number of Tokio worker threads to use"),
+                .help("Number of Tokio worker threads (default: max(1, logical CPUs / 2))"),
         )
         .arg(
             Arg::new("nagle")
@@ -289,5 +330,65 @@ pub fn new_command() -> clap::ArgMatches {
                 .value_name("FILE")
                 .help("Export final results to a CSV file"),
         )
-        .get_matches()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PIPELINE_BATCH_BYTES, build_pipeline_message, command, default_worker_count,
+        pipeline_in_flight_batches, worker_count,
+    };
+    use bytes::Bytes;
+
+    #[test]
+    fn pipeline_batch_uses_sixteen_kibibytes() {
+        let message = Bytes::from(vec![0x5a; 1024]);
+        let (batch, message_count) = build_pipeline_message(Some(&message));
+        let batch = batch.expect("pipeline batch");
+
+        assert_eq!(message_count, 16);
+        assert_eq!(batch.len(), PIPELINE_BATCH_BYTES);
+        assert!(
+            batch
+                .chunks_exact(message.len())
+                .all(|chunk| chunk == message.as_ref())
+        );
+    }
+
+    #[test]
+    fn pipeline_window_retains_four_rate_limited_batches() {
+        assert_eq!(pipeline_in_flight_batches(1024, 5), 4);
+    }
+
+    #[test]
+    fn pipeline_window_uses_two_full_sixteen_kibibyte_batches() {
+        assert_eq!(pipeline_in_flight_batches(1024, 16), 2);
+    }
+
+    #[test]
+    fn pipeline_window_accounts_for_the_message_count_cap() {
+        assert_eq!(pipeline_in_flight_batches(16, 256), 4);
+    }
+
+    #[test]
+    fn pipeline_window_retains_four_large_messages() {
+        assert_eq!(pipeline_in_flight_batches(20 * 1024, 1), 4);
+    }
+
+    #[test]
+    fn workers_default_to_half_available_parallelism() {
+        let matches = command()
+            .try_get_matches_from(["tcpkali2", "127.0.0.1:9000"])
+            .unwrap();
+        assert_eq!(worker_count(&matches), default_worker_count());
+        assert!(worker_count(&matches) >= 1);
+    }
+
+    #[test]
+    fn explicit_workers_override_the_dynamic_default() {
+        let matches = command()
+            .try_get_matches_from(["tcpkali2", "-w", "37", "127.0.0.1:9000"])
+            .unwrap();
+        assert_eq!(worker_count(&matches), 37);
+    }
 }
